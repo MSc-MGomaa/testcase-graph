@@ -148,18 +148,34 @@
   function restart(newGraph){
     graph = newGraph;
     buildAdjacency();
-    // mutate link endpoints to node refs if not already, using string ids
-    const byId = new Map(graph.nodes.map(n => [n.id.toString(), n]));
+
+    // Map string ids to node objects for links
+    const byId = new Map(graph.nodes.map(n => [String(n.id), n]));
     graph.links.forEach(l => {
-      if (typeof l.source === 'string') l.source = byId.get(l.source.toString());
-      if (typeof l.target === 'string') l.target = byId.get(l.target.toString());
+      if (typeof l.source === 'string') l.source = byId.get(String(l.source));
+      if (typeof l.target === 'string') l.target = byId.get(String(l.target));
+    });
+
+    // Seed positions in a centered grid so nodes are immediately visible
+    const cols = Math.max(1, Math.ceil(Math.sqrt(graph.nodes.length)));
+    const gap  = 28;
+    const cx = innerWidth/2, cy = innerHeight/2;
+    graph.nodes.forEach((n,i) => {
+      if (n.x == null || n.y == null) {
+        const r = Math.floor(i / cols), c = i % cols;
+        n.x = cx + (c - cols/2) * gap;
+        n.y = cy + (r - cols/2) * gap;
+      }
     });
 
     sim.nodes(graph.nodes).on('tick', ticked);
     sim.force('link').links(graph.links);
     sim.alpha(1).restart();
+
     makeLegend();
     render();
+    // Ensure we center/zoom after (re)start
+    setTimeout(()=>document.getElementById('fit').click(), 300);
   }
 
   function makeLegend(){
