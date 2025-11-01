@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Force‑Directed Graph (Canvas) — Template v2</title>
+  <style>
+    :root { --bg:#0b1020; --panel:#121a33; --panel2:#0e1630; --text:#e9eefc; --muted:#9fb3ff; --accent:#7aa2ff; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    header { position:fixed; inset:12px 12px auto 12px; z-index:10; display:flex; gap:10px; flex-wrap:wrap; align-items:center; background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02)); border:1px solid rgba(255,255,255,.08); padding:10px 12px; border-radius:14px; backdrop-filter: blur(6px); }
+    header h1 { font-size:14px; margin:0 8px 0 0; font-weight:600; color:var(--muted); }
+    header input, header select { background:var(--panel); color:var(--text); border:1px solid rgba(255,255,255,.1); border-radius:10px; padding:8px 10px; }
+    header button { background:var(--accent); color:#081025; border:0; padding:8px 12px; border-radius:10px; font-weight:600; cursor:pointer; }
+    header .row { display:flex; gap:8px; align-items:center; }
+    #tooltip { position:fixed; pointer-events:none; background:var(--panel); color:var(--text); border:1px solid rgba(255,255,255,.15); padding:6px 8px; border-radius:8px; font-size:12px; opacity:0; transform:translate(-50%, -120%); }
+    #legend { position:fixed; right:12px; top:12px; background:var(--panel2); border:1px solid rgba(255,255,255,.08); padding:8px 10px; border-radius:12px; max-height:40vh; overflow:auto; }
+    #canvas { position:fixed; inset:0; display:block; }
+    footer { position:fixed; left:12px; bottom:12px; color:var(--muted); font-size:12px; opacity:.8; }
+    .slider { width:130px; accent-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Force‑Directed Graph</h1>
+    <div class="row">
+      <input id="search" type="search" placeholder="Search node id / name…" />
+      <button id="fit">Fit</button>
+      <label>Charge <input id="charge" class="slider" type="range" min="-3000" max="-50" step="10" value="-600"></label>
+      <label>Link dist <input id="linkdist" class="slider" type="range" min="10" max="300" step="5" value="60"></label>
+      <input id="file" type="file" accept="application/json" />
+      <button id="export">Export PNG</button>
+    </div>
+  </header>
+
+  <canvas id="canvas"></canvas>
+  <div id="tooltip"></div>
+  <div id="legend"></div>
+  <footer>Tip: drag nodes to pin, double‑click to unpin. Wheel = zoom, drag empty space = pan.</footer>
+
+  <!-- D3 for forces & utilities -->
+  <script src="https://unpkg.com/d3@7"></script>
+  <script>
+  // ==== SAMPLE DATA (shown until you load a file) ====
+  const sample = {
+    nodes: [
+      { id: "TC-001", group: "Login", label:"Valid login" },
+      { id: "TC-002", group: "Login", label:"Invalid password" },
+      { id: "TC-101", group: "Checkout", label:"Add to cart" },
+      { id: "TC-102", group: "Checkout", label:"Payment success" },
+      { id: "TC-201", group: "Profile", label:"Edit profile" },
+      { id: "TC-202", group: "Profile", label:"Change password" }
+    ],
+    links: [
+      { source: "TC-001", target: "TC-202", weight: 1 },
+      { source: "TC-001", target: "TC-101", weight: 2 },
+      { source: "TC-002", target: "TC-202", weight: 1 },
+      { source: "TC-101", target: "TC-102", weight: 3 },
+      { source: "TC-201", target: "TC-202", weight: 1 },
+      { source: "TC-201", target: "TC-101", weight: 1 }
+    ]
+  };
+
+  // === Canvas + Simulation Setup ===
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const tooltip = document.getElementById('tooltip');
+  const legendEl = document.getElementById('legend');
+  const DPR = Math.max(1, window.devicePixelRatio || 1);
+
+  function resize() {
+    canvas.width = innerWidth * DPR; canvas.height = innerHeight * DPR;
+    canvas.style.width = innerWidth + 'px'; canvas.style.height = innerHeight + 'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    render();
+  }
+  addEventListener('resize', resize);
+
+  let graph = structuredClone(sample);
+  let color = d3.scaleOrdinal(d3.schemeTableau10);
+
+  let transform = d3.zoomIdentity;
+  const zoom = d3.zoom().scaleExtent([0.05, 6]).on('zoom', (event) => {
+    transform = event.transform; render();
+  });
+  d3.select(canvas).call(zoom);
+
+  const sim = d3.forceSimulation()
+    .force('link', d3.forceLink().id(d => d.id).distance(60).strength(0.6))
+    .force('charge', d3.forceManyBody().strength(-600))
+    .force('collide', d3.forceCollide().radius(d => radius(d) + 2))
+    .force('center', d3.forceCenter(() => canvas.width / (2*DPR), () => canvas.height / (2*DPR)));
+
+  let hovered = null, pinned = new Set();
+  let adjacency = new Map(); // nodeId -> Set(neighborIds)
+
+  function buildAdjacency() {
+    adjacency.clear();
+    graph.nodes.forEach(n => adjacency.set(n.id, new Set()));
+    graph.links.forEach(l => { adjacency.get(l.source.id ?? l.source)?.add(l.target.id ?? l.target); adjacency.get(l.target.id ?? l.target)?.add(l.source.id ?? l.source); });
+  }
+
+  function radius(d){
+    // Size nodes by degree (neighbors) with min/max clamps
+    const deg = (adjacency.get(d.id)?.size || 0);
+    return Math.max(4, Math.min(18, 4 + Math.sqrt(deg)));
+  }
+
+  function ticked(){ render(); }
+
+  function render(){
+    if(!graph) return;
+    ctx.save();
+    ctx.clearRect(0,0,canvas.width/DPR,canvas.height/DPR);
+    ctx.translate(transform.x, transform.y);
+    ctx.scale(transform.k, transform.k);
+
+    // Draw links
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.6;
+    ctx.strokeStyle = '#6c7db3';
+    for (const l of graph.links) {
+      if (!l.source || !l.target) continue;
+      ctx.beginPath();
+      ctx.moveTo(l.source.x, l.source.y);
+      ctx.lineTo(l.target.x, l.target.y);
+      ctx.stroke();
+    }
+
+    // Draw nodes
+    ctx.globalAlpha = 1;
+    for (const n of graph.nodes) {
+      const r = radius(n);
+      ctx.beginPath();
+      ctx.fillStyle = color(n.group ?? 'default');
+      ctx.arc(n.x, n.y, r, 0, Math.PI*2);
+      ctx.fill();
+
+      // highlight ring
+      if (hovered && (n === hovered || adjacency.get(hovered.id)?.has(n.id))) {
+        ctx.lineWidth = 2; ctx.strokeStyle = '#fff';
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 2.5, 0, Math.PI*2); ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+  }
+
+  function restart(newGraph){
+    graph = newGraph;
+    buildAdjacency();
+    // mutate link endpoints to node refs if not already, using string ids
+    const byId = new Map(graph.nodes.map(n => [n.id.toString(), n]));
+    graph.links.forEach(l => {
+      if (typeof l.source === 'string') l.source = byId.get(l.source.toString());
+      if (typeof l.target === 'string') l.target = byId.get(l.target.toString());
+    });
+
+    sim.nodes(graph.nodes).on('tick', ticked);
+    sim.force('link').links(graph.links);
+    sim.alpha(1).restart();
+    makeLegend();
+    render();
+  }
+
+  function makeLegend(){
+    const groups = Array.from(new Set(graph.nodes.map(d => d.group).filter(Boolean)));
+    legendEl.innerHTML = '<b>Groups</b>' + (groups.length ? '<ul style="list-style:none; padding:6px 0 0; margin:0"></ul>' : ' <span style="color:#9fb3ff">(none)</span>');
+    if (!groups.length) return;
+    const ul = legendEl.querySelector('ul');
+    for (const g of groups) {
+      const li = document.createElement('li');
+      li.style.display='flex'; li.style.alignItems='center'; li.style.gap='8px';
+      const sw = document.createElement('span'); sw.style.width='12px'; sw.style.height='12px'; sw.style.borderRadius='50%'; sw.style.background=color(g); sw.style.display='inline-block';
+      li.appendChild(sw);
+      const txt = document.createElement('span'); txt.textContent = g; li.appendChild(txt);
+      ul.appendChild(li);
+    }
+  }
+
+  // === Pointer interactions ===
+  const pickRadius = 15; // px in screen space
+  function pickNode(px, py){
+    // Convert screen -> world coords
+    const x = (px - transform.x) / transform.k;
+    const y = (py - transform.y) / transform.k;
+    return sim.find(x, y, pickRadius / transform.k);
+  }
+
+  let dragNode = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    const n = pickNode(e.clientX, e.clientY);
+    if (n) {
+      dragNode = n; n.fx = n.x; n.fy = n.y; pinned.add(n.id);
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (dragNode) {
+      const x = (e.clientX - transform.x) / transform.k;
+      const y = (e.clientY - transform.y) / transform.k;
+      dragNode.fx = x; dragNode.fy = y; sim.alphaTarget(0.2).restart();
+    }
+
+    const n = pickNode(e.clientX, e.clientY);
+    hovered = n || null;
+    if (n) {
+      tooltip.style.opacity = 1;
+      tooltip.style.left = e.clientX + 'px';
+      tooltip.style.top = e.clientY + 'px';
+      tooltip.innerHTML = `<b>${n.label ?? n.id}</b><br/><span style="opacity:.8">${n.group ?? ''}</span>`;
+    } else {
+      tooltip.style.opacity = 0;
+    }
+    render();
+  });
+  addEventListener('pointerup', () => { dragNode = null; sim.alphaTarget(0); });
+  canvas.addEventListener('dblclick', (e) => {
+    const n = pickNode(e.clientX, e.clientY);
+    if (n) { n.fx = null; n.fy = null; pinned.delete(n.id); sim.alpha(0.7).restart(); }
+  });
+
+  // === Controls ===
+  document.getElementById('charge').addEventListener('input', (e)=>{
+    sim.force('charge').strength(+e.target.value); sim.alpha(0.5).restart();
+  });
+  document.getElementById('linkdist').addEventListener('input', (e)=>{
+    sim.force('link').distance(+e.target.value); sim.alpha(0.5).restart();
+  });
+  document.getElementById('fit').addEventListener('click', ()=>{
+    // Fit bounds of graph into viewport (rough)
+    if (!graph.nodes || !graph.nodes.length) return;
+    const xs = graph.nodes.map(n=>n.x), ys = graph.nodes.map(n=>n.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const w = maxX - minX, h = maxY - minY;
+    const k = Math.min(innerWidth/(w+80), innerHeight/(h+80));
+    const x = innerWidth/2 - k*(minX + w/2);
+    const y = innerHeight/2 - k*(minY + h/2);
+    const t = d3.zoomIdentity.translate(x,y).scale(k || 1);
+    d3.select(canvas).transition().duration(600).call(zoom.transform, t);
+  });
+
+  // Search
+  document.getElementById('search').addEventListener('keydown', (e)=>{
+    if (e.key !== 'Enter') return; const q = e.target.value.trim(); if (!q) return;
+    const n = graph.nodes.find(n => (n.id+'' === q) || (n.label && n.label.toLowerCase().includes(q.toLowerCase())));
+    if (n) {
+      const t = d3.zoomIdentity.translate(innerWidth/2 - transform.k*n.x, innerHeight/2 - transform.k*n.y).scale(transform.k);
+      d3.select(canvas).transition().duration(400).call(zoom.transform, t);
+      hovered = n; render();
+    } else {
+      alert('No node matched that query.');
+    }
+  });
+
+  // Import JSON file with robust normalization
+  document.getElementById('file').addEventListener('change', async (e)=>{
+    const file = e.target.files[0]; if (!file) return;
+    let json;
+    try {
+      const text = await file.text();
+      json = JSON.parse(text);
+    } catch (err) {
+      console.error(err);
+      alert('Could not parse JSON. Make sure it is valid.');
+      return;
+    }
+
+    // Accept {nodes,links} or {nodes,edges}
+    if (!json.links && json.edges) json.links = json.edges;
+    if (!Array.isArray(json.nodes) || !Array.isArray(json.links)) {
+      alert('JSON must have arrays: { nodes:[], links:[] }');
+      return;
+    }
+
+    // Normalize node ids to strings
+    const nodesById = new Map();
+    json.nodes = json.nodes.map((n,i) => {
+      const id = (n.id ?? i).toString();
+      const node = { ...n, id };
+      nodesById.set(id, node);
+      return node;
+    });
+
+    // Normalize links; coerce endpoints to strings; drop broken links
+    let dropped = 0;
+    json.links = json.links.map(l => ({
+      ...l,
+      source: (typeof l.source === 'object' ? l.source?.id : l.source)?.toString(),
+      target: (typeof l.target === 'object' ? l.target?.id : l.target)?.toString()
+    })).filter(l => {
+      const ok = nodesById.has(l.source) && nodesById.has(l.target);
+      if (!ok) dropped++;
+      return ok;
+    });
+
+    if (json.nodes.length === 0) { alert('No nodes found in JSON.'); return; }
+    if (json.links.length === 0) { alert('No valid links found (check source/target ids).'); }
+    if (dropped > 0) alert(`Note: ${dropped} link(s) were dropped because their node ids were missing.`);
+
+    restart(json);
+    setTimeout(()=>document.getElementById('fit').click(), 400);
+  });
+
+  // Export PNG
+  document.getElementById('export').addEventListener('click', ()=>{
+    const a = document.createElement('a');
+    a.download = 'graph.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  });
+
+  // Kick off
+  resize();
+  restart(graph);
+  setTimeout(()=>document.getElementById('fit').click(), 600);
+  </script>
+</body>
+</html>
